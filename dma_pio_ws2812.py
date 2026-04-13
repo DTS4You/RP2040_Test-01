@@ -1,102 +1,124 @@
-from machine import Pin     # type: ignore
-import rp2                  # type: ignore
+from machine import Pin, mem32
+import rp2
 import array
-import time
-import _thread
 
-class WS2812DMADoubleBuffer:
-    def __init__(self, pin, num_leds, sm_id=0, freq=8_000_000):
-        self.num_leds = num_leds
-        self.lock = _thread.allocate_lock()
+DMA_BASE = 0x50000000
+DMA_CH_SIZE = 0x40
 
-        # --- PIO Programm ---
-        @rp2.asm_pio(
-            sideset_init=rp2.PIO.OUT_LOW,
-            out_shift_dir=rp2.PIO.SHIFT_LEFT,
-            autopull=True,
-            pull_thresh=24
-        )
-        def ws2812():
-            T1 = 2
-            T2 = 5
-            T3 = 3
-            wrap_target()
-            label("bitloop")
-            out(x, 1)               .side(0) [T3 - 1]
-            jmp(not_x, "do_zero")   .side(1) [T1 - 1]
-            jmp("bitloop")          .side(1) [T2 - 1]
-            label("do_zero")
-            nop()                   .side(0) [T2 - 1]
-            wrap()
+PIO0_BASE = 0x50200000
+PIO1_BASE = 0x50300000
 
-        self.sm = rp2.StateMachine(
-            sm_id,
-            ws2812,
-            freq=freq,
-            sideset_base=Pin(pin)
-        )
-        self.sm.active(1)
+def pio_txf(pio, sm):
+    return (PIO0_BASE if pio == 0 else PIO1_BASE) + 0x10 + sm*4
 
-        # --- Double Buffer ---
-        self.front_buf = array.array("I", [0] * num_leds)
-        self.back_buf  = array.array("I", [0] * num_leds)
+def dreq(pio, sm):
+    return (0 if pio == 0 else 8) + sm
 
-        # --- DMA ---
-        self.dma = rp2.DMA()
-        self.dma.config(
-            read=self.front_buf,
-            write=self.sm,
-            count=num_leds,
-            ctrl=rp2.DMA.CTRL(
-                inc_read=True,
-                inc_write=False,
-                treq_sel=rp2.DREQ_PIO0_TX0
+
+class DMAChannel:
+    def __init__(self, ch):
+        self.base = DMA_BASE + ch * DMA_CH_SIZE
+
+    def config(self, read, write, count, ctrl):
+        mem32[self.base + 0x00] = read
+        mem32[self.base + 0x04] = write
+        mem32[self.base + 0x08] = count
+        mem32[self.base + 0x0C] = ctrl
+
+    def start(self):
+        mem32[self.base + 0x0C] |= 1
+
+    def busy(self):
+        return (mem32[self.base + 0x0C] >> 24) & 1
+
+
+@rp2.asm_pio(
+    sideset_init=rp2.PIO.OUT_LOW,
+    autopull=True,
+    pull_thresh=24
+)
+def ws2812():
+    T1 = 2
+    T2 = 5
+    T3 = 3
+    wrap_target()
+    label("bitloop")
+    out(x, 1)               .side(0) [T3 - 1]
+    jmp(not_x, "zero")      .side(1) [T1 - 1]
+    jmp("bitloop")          .side(1) [T2 - 1]
+    label("zero")
+    nop()                   .side(0) [T2 - 1]
+    wrap()
+
+
+class WS2812_8Strip_DMA:
+    def __init__(self, pins, num_leds):
+        assert len(pins) == 8
+        self.n = num_leds
+
+        self.buffers = [array.array("I", [0]*num_leds) for _ in range(8)]
+        self.dmas = []
+        self.sms = []
+
+        # --- PIO0 (Strips 0-3) ---
+        for i in range(4):
+            sm = rp2.StateMachine(
+                i, ws2812,
+                freq=8_000_000,
+                sideset_base=Pin(pins[i])
             )
-        )
+            sm.active(1)
+            self.sms.append(sm)
 
-    # --------- Zeichnen in BACK buffer ---------
-    def set_pixel(self, i, r, g, b):
-        self.back_buf[i] = (g << 16) | (r << 8) | b
+        # --- PIO1 (Strips 4-7) ---
+        for i in range(4):
+            sm = rp2.StateMachine(
+                4+i, ws2812,
+                freq=8_000_000,
+                sideset_base=Pin(pins[4+i])
+            )
+            sm.active(1)
+            self.sms.append(sm)
 
-    def fill(self, r, g, b):
+        # --- DMA Channels ---
+        for ch in range(8):
+            self.dmas.append(DMAChannel(ch))
+
+    # -------- API --------
+    def set_pixel(self, strip, i, r, g, b):
+        self.buffers[strip][i] = (g << 16) | (r << 8) | b
+
+    def fill(self, strip, r, g, b):
         val = (g << 16) | (r << 8) | b
-        for i in range(self.num_leds):
-            self.back_buf[i] = val
+        for i in range(self.n):
+            self.buffers[strip][i] = val
 
-    def clear(self):
-        self.fill(0, 0, 0)
-
-    # --------- Buffer tauschen ---------
-    def swap(self):
-        self.lock.acquire()
-        self.front_buf, self.back_buf = self.back_buf, self.front_buf
-        self.dma.config(read=self.front_buf)  # DMA auf neuen Buffer zeigen
-        self.lock.release()
-
-    # --------- Ausgabe ---------
     def show(self):
-        self.lock.acquire()
-        self.dma.start()
-        self.dma.wait()
-        self.lock.release()
-        time.sleep_us(60)
+        # alle DMA konfigurieren
+        for i in range(8):
+            pio = 0 if i < 4 else 1
+            sm  = i if i < 4 else i - 4
 
-    # optional HSV
-    def set_hsv(self, i, h, s, v):
-        h %= 360
-        c = v * s
-        x = c * (1 - abs((h / 60) % 2 - 1))
-        m = v - c
+            ctrl = (
+                (1 << 0) |
+                (2 << 2) |
+                (1 << 5) |
+                (0 << 6) |
+                (dreq(pio, sm) << 15)
+            )
 
-        if h < 60:   r,g,b = c,x,0
-        elif h < 120:r,g,b = x,c,0
-        elif h < 180:r,g,b = 0,c,x
-        elif h < 240:r,g,b = 0,x,c
-        elif h < 300:r,g,b = x,0,c
-        else:        r,g,b = c,0,x
+            self.dmas[i].config(
+                read=id(self.buffers[i]),
+                write=pio_txf(pio, sm),
+                count=self.n,
+                ctrl=ctrl
+            )
 
-        self.set_pixel(i,
-            int((r+m)*255),
-            int((g+m)*255),
-            int((b+m)*255)
-        )
+        # alle gleichzeitig starten
+        for dma in self.dmas:
+            dma.start()
+
+        # warten
+        while any(dma.busy() for dma in self.dmas):
+            pass
+

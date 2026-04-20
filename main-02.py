@@ -65,17 +65,17 @@ class WS2812_DMA:
         self.buffer[i] = (g_val << 16) | (r_val << 8) | b_val
 
 # --- Test-Programm ---
-LEDS = 1000
-strip = WS2812_DMA(15, LEDS)
+LEDS = 14
+strip = WS2812_DMA(3, LEDS)
 
 # Puffer füllen
 for i in range(LEDS):
-    strip.set_pixel(i, 255, 0, 100) # Pink
+    strip.set_pixel(i, 0, 0, 100, 1) # Pink
 
 print("Starte non-blocking Transfer...")
 start_time = time.ticks_us()
 
-strip.show() # Schickt 1000 LEDs los
+strip.show()
 
 # HIER IST DER BEWEIS:
 end_time = time.ticks_us()

@@ -84,14 +84,14 @@ try:
         for s in range(8):
             for i in range(20):
                 leds.set_pixel(s, i, 0, 0, 0)
-            leds.set_pixel(s, step, 0, 30, 0)
+            leds.set_pixel(s, step, 0, 0, 30)
         
         if step < 19:
             step += 1
         else:
             step = 0
         leds.show()
-        time.sleep(0.04)
+        time.sleep(0.3)
 except KeyboardInterrupt:
     # Clear all
     for s in range(8):
